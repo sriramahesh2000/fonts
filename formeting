@@ -1,0 +1,276 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+import pymupdf as fitz  # PyMuPDF
+from reportlab.pdfgen import canvas
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import Paragraph
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase import pdfmetrics
+from reportlab.lib.pagesizes import letter
+import requests
+import shutil
+import os
+import time
+app = FastAPI()
+ 
+# Mapping from frontend language names to FLORES-200 codes
+language_mapping = {
+    "german": "deu_Latn",
+    "french": "fra_Latn",
+    "dutch": "nld_Latn",
+    "mandarin": "zho_Hans",
+    "spanish": "spa_Latn",
+    # Add more mappings as needed
+}
+ 
+# Function to translate text to the target language
+def translate_text(text_chunk: str, frontend_lang: str) -> str:
+    target_lang = language_mapping.get(frontend_lang.lower())
+    if not target_lang:
+        raise ValueError(f"Language '{frontend_lang}' is not supported or mapping is missing.")
+   
+    # FastAPI translation endpoint (replace with actual URL)
+    url = "https://rich-concrete-perch.ngrok-free.app/translate"
+   
+    payload = {
+        "text": text_chunk,
+        "target_lang": target_lang
+    }
+   
+    response = requests.post(url, json=payload)
+   
+    if response.status_code == 200:
+        translation = response.json().get('translation')
+        return translation
+    else:
+        raise Exception(f"Failed to translate text. Status code: {response.status_code}, Detail: {response.text}")
+ 
+# Function to combine spans
+def combine_spans_in_translation(data):
+    combined_text_dict = {}
+    temp_combined_text = ""
+    combination_spans = []
+    previous_span = None
+ 
+    for block in data['blocks']:
+        if 'lines' in block:
+            for line in block['lines']:
+                for span in line['spans']:
+                    text = span["text"]
+                    ascender = span["ascender"]
+                    descender = span["descender"]
+                    size = span["size"]
+                    flags = span["flags"]
+                    origin_x = span["origin"][0]
+ 
+                    if (text.strip() != "" and previous_span and
+                        ascender == previous_span["ascender"] and
+                        descender == previous_span["descender"] and
+                        size == previous_span["size"] and
+                        flags == previous_span["flags"] and
+                        origin_x == previous_span["origin"][0]):
+ 
+                        temp_combined_text += text
+                        combination_spans.append(text)
+ 
+                    else:
+                        if combination_spans:
+                            combined_text_dict[combination_spans[0]] = temp_combined_text
+                            for span_text in combination_spans[1:]:
+                                combined_text_dict[span_text] = ""
+ 
+                            temp_combined_text = ""
+                            combination_spans = []
+ 
+                        if text.strip() != "":
+                            temp_combined_text = text
+                            combination_spans = [text]
+                            combined_text_dict[text] = text
+ 
+                    previous_span = span
+ 
+    if combination_spans:
+        combined_text_dict[combination_spans[0]] = temp_combined_text
+        for span_text in combination_spans[1:]:
+            combined_text_dict[span_text] = ""
+ 
+    return combined_text_dict
+ 
+# Function to replace text in spans with translated and combined text
+def replace_span_text_with_combined(data, combined_text_dict):
+    for block in data['blocks']:
+        if 'lines' in block:
+            for line in block['lines']:
+                for span in line['spans']:
+                    span_text = span['text']
+                    if span_text in combined_text_dict:
+                        span['text'] = combined_text_dict[span_text]
+ 
+    return data
+ 
+# Function to register fonts
+def register_fonts():
+    try:
+        # Register fonts here
+        pdfmetrics.registerFont(TTFont('TimesNewRomanPSMT', './fonts/TimesNewRomanPSMT.ttf'))
+        pdfmetrics.registerFont(TTFont('TimesNewRomanPS-BoldMT', './fonts/TimesNewRomanPS BoldMT.ttf'))
+        pdfmetrics.registerFont(TTFont('TimesNewRomanPS-ItalicMT', './fonts/TimesNewRomanPS BoldMT.ttf'))
+        pdfmetrics.registerFont(TTFont('TimesNewRomanPS-BoldItalicMT', './fonts/TimesNewRomanPS BoldMT.ttf'))
+ 
+        # Calibri
+        pdfmetrics.registerFont(TTFont('Calibri', './fonts/Calibri.ttf'))
+        pdfmetrics.registerFont(TTFont('Calibri-Bold', './fonts/calibrib.ttf'))
+        pdfmetrics.registerFont(TTFont('Calibri-Italic', './fonts/calibril.ttf'))
+        pdfmetrics.registerFont(TTFont('Calibri-BoldItalic', './fonts/calibril.ttf'))
+ 
+        # SymbolMT
+        pdfmetrics.registerFont(TTFont('SymbolMT', './fonts/SymbolMT.ttf'))
+ 
+        # ArialMT
+        pdfmetrics.registerFont(TTFont('ArialMT', './fonts/ArialMT.ttf'))
+        pdfmetrics.registerFont(TTFont('Arial-BoldMT', './fonts/ArialMT.ttf'))
+        pdfmetrics.registerFont(TTFont('Arial-ItalicMT', './fonts/G_ari_i.TTF'))
+        pdfmetrics.registerFont(TTFont('Arial-BoldItalicMT', './fonts/GEO_AI__.TTF'))
+        # Add more fonts as needed
+    except Exception as e:
+        print(f"Error registering font: {e}")
+ 
+FONT_MAPPING = FONT_MAPPING = {
+    'TimesNewRomanPSMT': 'TimesNewRomanPSMT',
+    'TimesNewRomanPS-BoldMT': 'TimesNewRomanPS-BoldMT',
+    'TimesNewRomanPS-ItalicMT': 'TimesNewRomanPS-ItalicMT',
+    'TimesNewRomanPS-BoldItalicMT': 'TimesNewRomanPS-BoldItalicMT',
+ 
+    'Calibri': 'Calibri',
+    'Calibri-Bold': 'Calibri-Bold',
+    'Calibri-Italic': 'Calibri-Italic',
+    'Calibri-BoldItalic': 'Calibri-BoldItalic',
+ 
+    'SymbolMT': 'SymbolMT',
+ 
+    'ArialMT': 'ArialMT',
+    'Arial-BoldMT': 'Arial-BoldMT',
+    'Arial-ItalicMT': 'Arial-ItalicMT',
+    'Arial-BoldItalicMT': 'Arial-BoldItalicMT',
+ 
+    # Add other fonts as needed
+}
+ 
+# Function to create the PDF with translated and styled text
+def create_pdf(data, output_path):
+    y_offset = 7
+    c = canvas.Canvas(output_path, pagesize=(data['width'], data['height']))
+    styles = getSampleStyleSheet()
+ 
+    for block in data['blocks']:
+        if 'lines' in block:
+            for line in block['lines']:
+                for span in line['spans']:
+                    if span['text']:
+                        font_name = span['font']
+                        font_size = span['size'] * 0.7
+                        text = span['text']
+                        x, y = span['origin']
+ 
+                        mapped_font_name = FONT_MAPPING.get(font_name, 'Helvetica')
+ 
+                        try:
+                            style = ParagraphStyle(name=mapped_font_name, fontName=mapped_font_name, fontSize=font_size)
+                        except Exception as e:
+                            print(f"Error with font {mapped_font_name}: {e}")
+                            style = ParagraphStyle(name="Fallback", fontName="Helvetica", fontSize=font_size)
+ 
+                        para = Paragraph(text, style)
+                        text_width = span['bbox'][2] - span['bbox'][0]
+                        text_height = span['bbox'][3] - span['bbox'][1]
+ 
+                        para_width, para_height = para.wrap(text_width + 10, text_height)
+                        para.drawOn(c, x, data['height'] - y - para_height + y_offset)
+ 
+    c.save()
+ 
+@app.post("/translate_pdf/")
+async def translate_pdf(file: UploadFile = File(...), frontend_lang: str = "french"):
+    temp_dir = "temp"
+    os.makedirs(temp_dir, exist_ok=True)
+   
+    input_path = os.path.join(temp_dir, file.filename)
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+ 
+    output_path = os.path.join(temp_dir, "translated_with_fonts.pdf")
+    vector_graphics_pdf = os.path.join(temp_dir, "vector_graphics_only.pdf")
+   
+    try:
+        register_fonts()
+        doc = fitz.open(input_path)
+        vector_outpdf = fitz.open()
+ 
+        for page_number in range(len(doc)):
+            page = doc[page_number]
+            paths = page.get_drawings()
+            outpage = vector_outpdf.new_page(width=page.rect.width, height=page.rect.height)
+            shape = outpage.new_shape()
+ 
+            for path in paths:
+                for item in path["items"]:
+                    if item[0] == "l":
+                        shape.draw_line(item[1], item[2])
+                    elif item[0] == "re":
+                        shape.draw_rect(item[1])
+                    elif item[0] == "qu":
+                        shape.draw_quad(item[1])
+                    elif item[0] == "c":
+                        shape.draw_bezier(item[1], item[2], item[3], item[4])
+                    else:
+                        raise ValueError("Unhandled drawing", item)
+ 
+                shape.commit()
+            shape = None  # Prevent further modification to the shape after committing
+        vector_outpdf.save(vector_graphics_pdf)
+ 
+        vector_doc = fitz.open(vector_graphics_pdf)
+ 
+        for page_number in range(len(vector_doc)):
+            page = vector_doc[page_number]
+            text = doc[page_number].get_text("dict")
+ 
+            combined_text_dict = combine_spans_in_translation(text)
+            for key, value in combined_text_dict.items():
+                if value:
+                    combined_text_dict[key] = translate_text(value, frontend_lang)
+ 
+            modify_text = replace_span_text_with_combined(text, combined_text_dict)
+ 
+            create_pdf({"blocks": modify_text["blocks"], "width": page.rect.width, "height": page.rect.height}, output_path)
+            temp_doc = fitz.open(output_path)
+            temp_page = temp_doc[0]
+ 
+            page.show_pdf_page(page.rect, temp_doc, 0)
+            temp_doc.close()
+ 
+        vector_doc.save(output_path)
+ 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+ 
+    finally:
+    # Ensure all resources are closed properly
+        if 'doc' in locals() and doc is not None and not doc.is_closed:
+            doc.close()
+        if 'vector_outpdf' in locals() and vector_outpdf is not None and not vector_outpdf.is_closed:
+            vector_outpdf.close()
+        if 'vector_doc' in locals() and vector_doc is not None and not vector_doc.is_closed:
+            vector_doc.close()
+ 
+        # Remove temporary files if they exist
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        if os.path.exists(vector_graphics_pdf):
+            os.remove(vector_graphics_pdf)
+     
+        if os.path.exists('temp/vector_graphics_only.pdf'):
+            os.remove('temp/vector_graphics_only.pdf')
+ 
+ 
+    return FileResponse(output_path, media_type="application/pdf", filename="translated.pdf")
